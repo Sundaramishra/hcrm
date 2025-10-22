@@ -1,726 +1,849 @@
 <?php
 session_start();
 require_once 'config/database.php';
+require_once 'includes/auth.php';
+require_once 'includes/functions.php';
 
-// Check if user is logged in and is admin
-if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
-    header('Location: dashboard.php');
-    exit;
-}
+// Check if user is logged in and has access
+requireLogin();
 
-$db = new Database();
+// Define allowed roles for different actions
+$viewRoles = ['admin', 'doctor', 'nurse', 'receptionist'];
+$manageRoles = ['admin', 'doctor']; // Only admin and doctor can add/edit doctors
+
+requireRole($viewRoles);
+
+$db = Database::getInstance();
 $message = '';
+$messageType = '';
 
-// Handle form submission for new doctor
-if ($_POST && isset($_POST['action']) && $_POST['action'] === 'add_doctor') {
-    try {
-        // Start transaction
-        $db->getConnection()->beginTransaction();
+// Handle form submissions
+if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    if (!in_array($_SESSION['role'], $manageRoles)) {
+        $message = 'You do not have permission to perform this action.';
+        $messageType = 'error';
+    } else {
+        $action = $_POST['action'] ?? '';
         
-        // Create user account first
-        $username = strtolower(str_replace(' ', '.', $_POST['first_name'] . '.' . $_POST['last_name']));
-        $email = $_POST['email'];
-        $password_hash = password_hash($_POST['password'], PASSWORD_DEFAULT);
-        
-        $user_sql = "INSERT INTO users (username, email, password_hash, role_id) VALUES (?, ?, ?, 2)";
-        $db->query($user_sql, [$username, $email, $password_hash]);
-        $user_id = $db->lastInsertId();
-        
-        // Generate employee ID
-        $employee_count = $db->query("SELECT COUNT(*) as count FROM doctors WHERE hospital_id = 1")->fetch()['count'];
-        $employee_id = 'DOC' . str_pad($employee_count + 1, 3, '0', STR_PAD_LEFT);
-        
-        // Insert doctor
-        $doctor_sql = "INSERT INTO doctors (user_id, hospital_id, department_id, employee_id, first_name, middle_name, last_name, specialization, qualification, experience_years, registration_number, phone, emergency_contact, address, date_of_birth, gender, blood_group, consultation_fee, joined_date) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-        
-        $db->query($doctor_sql, [
-            $user_id,
-            $_POST['department_id'] ?: null,
-            $employee_id,
-            $_POST['first_name'],
-            $_POST['middle_name'],
-            $_POST['last_name'],
-            $_POST['specialization'],
-            $_POST['qualification'],
-            $_POST['experience_years'],
-            $_POST['registration_number'],
-            $_POST['phone'],
-            $_POST['emergency_contact'],
-            $_POST['address'],
-            $_POST['date_of_birth'],
-            $_POST['gender'],
-            $_POST['blood_group'],
-            $_POST['consultation_fee'],
-            $_POST['joined_date']
-        ]);
-        
-        $db->getConnection()->commit();
-        $message = "Doctor added successfully! Employee ID: " . $employee_id . ", Username: " . $username;
-    } catch (Exception $e) {
-        $db->getConnection()->rollBack();
-        $message = "Error: " . $e->getMessage();
+        try {
+            switch ($action) {
+                case 'add_doctor':
+                    $employee_id = trim($_POST['employee_id']);
+                    $name = trim($_POST['name']);
+                    $email = trim($_POST['email']);
+                    $phone = trim($_POST['phone']);
+                    $specialization = trim($_POST['specialization']);
+                    $department_id = (int)$_POST['department_id'];
+                    $qualification = trim($_POST['qualification']);
+                    $experience = (int)$_POST['experience'];
+                    $consultation_fee = (float)$_POST['consultation_fee'];
+                    $address = trim($_POST['address']);
+                    $date_of_birth = $_POST['date_of_birth'];
+                    $gender = $_POST['gender'];
+                    $emergency_contact = trim($_POST['emergency_contact']);
+                    $license_number = trim($_POST['license_number']);
+                    $status = $_POST['status'] ?? 'active';
+                    
+                    // Check if employee ID already exists
+                    $checkStmt = $db->query("SELECT id FROM doctors WHERE employee_id = ?", [$employee_id]);
+                    if ($checkStmt->fetch()) {
+                        throw new Exception("Employee ID already exists");
+                    }
+                    
+                    // Check if email already exists
+                    $checkStmt = $db->query("SELECT id FROM doctors WHERE email = ?", [$email]);
+                    if ($checkStmt->fetch()) {
+                        throw new Exception("Email already exists");
+                    }
+                    
+                    $stmt = $db->query(
+                        "INSERT INTO doctors (employee_id, name, email, phone, specialization, department_id, qualification, experience, consultation_fee, address, date_of_birth, gender, emergency_contact, license_number, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [$employee_id, $name, $email, $phone, $specialization, $department_id, $qualification, $experience, $consultation_fee, $address, $date_of_birth, $gender, $emergency_contact, $license_number, $status]
+                    );
+                    
+                    logActivity($_SESSION['user_id'], 'Add Doctor', "Added doctor: $name (ID: $employee_id)");
+                    $message = 'Doctor added successfully!';
+                    $messageType = 'success';
+                    break;
+                    
+                case 'update_doctor':
+                    $id = (int)$_POST['id'];
+                    $employee_id = trim($_POST['employee_id']);
+                    $name = trim($_POST['name']);
+                    $email = trim($_POST['email']);
+                    $phone = trim($_POST['phone']);
+                    $specialization = trim($_POST['specialization']);
+                    $department_id = (int)$_POST['department_id'];
+                    $qualification = trim($_POST['qualification']);
+                    $experience = (int)$_POST['experience'];
+                    $consultation_fee = (float)$_POST['consultation_fee'];
+                    $address = trim($_POST['address']);
+                    $date_of_birth = $_POST['date_of_birth'];
+                    $gender = $_POST['gender'];
+                    $emergency_contact = trim($_POST['emergency_contact']);
+                    $license_number = trim($_POST['license_number']);
+                    $status = $_POST['status'];
+                    
+                    // Check if employee ID already exists for other doctors
+                    $checkStmt = $db->query("SELECT id FROM doctors WHERE employee_id = ? AND id != ?", [$employee_id, $id]);
+                    if ($checkStmt->fetch()) {
+                        throw new Exception("Employee ID already exists");
+                    }
+                    
+                    // Check if email already exists for other doctors
+                    $checkStmt = $db->query("SELECT id FROM doctors WHERE email = ? AND id != ?", [$email, $id]);
+                    if ($checkStmt->fetch()) {
+                        throw new Exception("Email already exists");
+                    }
+                    
+                    $stmt = $db->query(
+                        "UPDATE doctors SET employee_id = ?, name = ?, email = ?, phone = ?, specialization = ?, department_id = ?, qualification = ?, experience = ?, consultation_fee = ?, address = ?, date_of_birth = ?, gender = ?, emergency_contact = ?, license_number = ?, status = ? WHERE id = ?",
+                        [$employee_id, $name, $email, $phone, $specialization, $department_id, $qualification, $experience, $consultation_fee, $address, $date_of_birth, $gender, $emergency_contact, $license_number, $status, $id]
+                    );
+                    
+                    logActivity($_SESSION['user_id'], 'Update Doctor', "Updated doctor: $name (ID: $employee_id)");
+                    $message = 'Doctor updated successfully!';
+                    $messageType = 'success';
+                    break;
+                    
+                case 'delete_doctor':
+                    $id = (int)$_POST['id'];
+                    
+                    // Get doctor info for logging
+                    $doctorStmt = $db->query("SELECT name, employee_id FROM doctors WHERE id = ?", [$id]);
+                    $doctor = $doctorStmt->fetch();
+                    
+                    if ($doctor) {
+                        // Soft delete
+                        $stmt = $db->query("UPDATE doctors SET status = 'inactive', deleted_at = NOW() WHERE id = ?", [$id]);
+                        
+                        logActivity($_SESSION['user_id'], 'Delete Doctor', "Deleted doctor: {$doctor['name']} (ID: {$doctor['employee_id']})");
+                        $message = 'Doctor deleted successfully!';
+                        $messageType = 'success';
+                    } else {
+                        throw new Exception("Doctor not found");
+                    }
+                    break;
+            }
+        } catch (Exception $e) {
+            $message = $e->getMessage();
+            $messageType = 'error';
+        }
     }
 }
 
-// Handle status toggle
-if ($_POST && isset($_POST['action']) && $_POST['action'] === 'toggle_status') {
-    try {
-        $doctor_id = $_POST['doctor_id'];
-        $new_status = $_POST['new_status'];
-        
-        $db->query("UPDATE doctors SET is_available = ? WHERE id = ?", [$new_status, $doctor_id]);
-        $db->query("UPDATE users SET is_active = ? WHERE id = (SELECT user_id FROM doctors WHERE id = ?)", [$new_status, $doctor_id]);
-        
-        $message = "Doctor status updated successfully!";
-    } catch (Exception $e) {
-        $message = "Error: " . $e->getMessage();
-    }
-}
-
-// Get doctors with search
+// Get search and filter parameters
 $search = $_GET['search'] ?? '';
-$filter_department = $_GET['department'] ?? '';
+$department_filter = $_GET['department'] ?? '';
+$status_filter = $_GET['status'] ?? '';
+$page = (int)($_GET['page'] ?? 1);
+$limit = 20;
+$offset = ($page - 1) * $limit;
 
-$sql = "SELECT d.*, 
-        CONCAT(d.first_name, ' ', d.last_name) as full_name,
-        dept.name as department_name,
-        u.email, u.is_active,
-        (SELECT COUNT(*) FROM appointments WHERE doctor_id = d.id) as total_appointments,
-        (SELECT COUNT(*) FROM appointments WHERE doctor_id = d.id AND appointment_date = CURDATE()) as today_appointments
-        FROM doctors d
-        LEFT JOIN departments dept ON d.department_id = dept.id
-        JOIN users u ON d.user_id = u.id
-        WHERE d.hospital_id = 1";
-
+// Build query
+$whereConditions = ["d.deleted_at IS NULL"];
 $params = [];
 
 if ($search) {
-    $sql .= " AND (d.first_name LIKE ? OR d.last_name LIKE ? OR d.employee_id LIKE ? OR d.specialization LIKE ?)";
-    $search_param = "%$search%";
-    $params = [$search_param, $search_param, $search_param, $search_param];
+    $whereConditions[] = "(d.name LIKE ? OR d.employee_id LIKE ? OR d.email LIKE ? OR d.phone LIKE ? OR d.specialization LIKE ?)";
+    $searchParam = "%$search%";
+    $params = array_merge($params, [$searchParam, $searchParam, $searchParam, $searchParam, $searchParam]);
 }
 
-if ($filter_department) {
-    $sql .= " AND d.department_id = ?";
-    $params[] = $filter_department;
+if ($department_filter) {
+    $whereConditions[] = "d.department_id = ?";
+    $params[] = $department_filter;
 }
 
-$sql .= " ORDER BY d.first_name, d.last_name";
+if ($status_filter) {
+    $whereConditions[] = "d.status = ?";
+    $params[] = $status_filter;
+}
 
-$doctors = $db->query($sql, $params)->fetchAll();
+$whereClause = implode(' AND ', $whereConditions);
 
-// Get departments for form and filter
-$departments = $db->query("SELECT * FROM departments WHERE hospital_id = 1 ORDER BY name")->fetchAll();
+// Get total count
+$countStmt = $db->query(
+    "SELECT COUNT(*) as total FROM doctors d WHERE $whereClause",
+    $params
+);
+$totalRecords = $countStmt->fetch()['total'];
+$totalPages = ceil($totalRecords / $limit);
+
+// Get doctors
+$stmt = $db->query(
+    "SELECT d.*, dept.name as department_name 
+     FROM doctors d 
+     LEFT JOIN departments dept ON d.department_id = dept.id 
+     WHERE $whereClause 
+     ORDER BY d.name ASC 
+     LIMIT $limit OFFSET $offset",
+    $params
+);
+$doctors = $stmt->fetchAll();
+
+// Get departments for dropdown
+$deptStmt = $db->query("SELECT * FROM departments WHERE status = 'active' ORDER BY name");
+$departments = $deptStmt->fetchAll();
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Doctor Management - Hospital CRM</title>
+    <title>Doctors Management - Hospital Management System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #3498db;
+            --success-color: #27ae60;
+            --danger-color: #e74c3c;
+            --warning-color: #f39c12;
+            --info-color: #17a2b8;
+            --light-color: #f8f9fa;
+            --dark-color: #343a40;
         }
-        
+
         body {
-            font-family: 'Poppins', sans-serif;
-            background: #f5f7fa;
+            background-color: #f5f6fa;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
+
+        .sidebar {
+            background: linear-gradient(180deg, var(--primary-color) 0%, #34495e 100%);
+            min-height: 100vh;
+            box-shadow: 2px 0 10px rgba(0,0,0,0.1);
         }
-        
-        .header {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+
+        .sidebar .nav-link {
+            color: #bdc3c7;
+            padding: 12px 20px;
+            margin: 5px 15px;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+        }
+
+        .sidebar .nav-link:hover, .sidebar .nav-link.active {
+            color: white;
+            background-color: rgba(255,255,255,0.1);
+            transform: translateX(5px);
+        }
+
+        .main-content {
+            background-color: white;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+            margin: 20px;
+            padding: 30px;
+        }
+
+        .stats-card {
+            background: linear-gradient(135deg, var(--secondary-color), #5dade2);
+            border-radius: 15px;
+            padding: 25px;
+            color: white;
             margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
         }
-        
-        .header h1 {
-            color: #004685;
-            font-size: 24px;
-        }
-        
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            font-size: 14px;
-            transition: background 0.3s;
-        }
-        
-        .btn-primary {
-            background: #004685;
-            color: white;
-        }
-        
-        .btn-primary:hover {
-            background: #003366;
-        }
-        
-        .btn-secondary {
-            background: #6c757d;
-            color: white;
-        }
-        
-        .btn-success {
-            background: #28a745;
-            color: white;
-        }
-        
-        .btn-danger {
-            background: #dc3545;
-            color: white;
-        }
-        
-        .btn-sm {
-            padding: 5px 10px;
-            font-size: 12px;
-        }
-        
-        .search-filters {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-        
-        .filter-form {
-            display: grid;
-            grid-template-columns: 2fr 1fr 1fr auto;
-            gap: 15px;
-            align-items: end;
-        }
-        
-        .form-group {
-            margin-bottom: 15px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            color: #333;
-            font-weight: 500;
-        }
-        
-        .form-group input, .form-group select, .form-group textarea {
-            width: 100%;
-            padding: 10px;
-            border: 2px solid #e1e1e1;
-            border-radius: 5px;
-            font-size: 16px;
-        }
-        
-        .form-group textarea {
-            height: 80px;
-            resize: vertical;
-        }
-        
-        .doctors-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-            gap: 20px;
-        }
-        
-        .doctor-card {
+
+        .table-container {
             background: white;
             border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             overflow: hidden;
-            transition: transform 0.3s;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
         }
-        
-        .doctor-card:hover {
-            transform: translateY(-5px);
-        }
-        
-        .doctor-header {
-            background: linear-gradient(135deg, #004685, #0066cc);
+
+        .table th {
+            background-color: var(--primary-color);
             color: white;
-            padding: 20px;
-            text-align: center;
-        }
-        
-        .doctor-header h3 {
-            font-size: 18px;
-            margin-bottom: 5px;
-        }
-        
-        .doctor-header p {
-            opacity: 0.9;
-            font-size: 14px;
-        }
-        
-        .doctor-body {
-            padding: 20px;
-        }
-        
-        .doctor-info {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 10px;
-            margin-bottom: 15px;
-        }
-        
-        .info-item {
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .info-item label {
-            font-size: 12px;
-            color: #666;
-            margin-bottom: 2px;
-        }
-        
-        .info-item span {
-            font-weight: 500;
-            color: #333;
-        }
-        
-        .doctor-stats {
-            display: flex;
-            justify-content: space-between;
-            margin: 15px 0;
-            padding: 10px;
-            background: #f8f9fa;
-            border-radius: 5px;
-        }
-        
-        .stat {
-            text-align: center;
-        }
-        
-        .stat .number {
-            font-size: 18px;
             font-weight: 600;
-            color: #004685;
-        }
-        
-        .stat .label {
-            font-size: 12px;
-            color: #666;
-        }
-        
-        .doctor-actions {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-        }
-        
-        .status-badge {
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-        }
-        
-        .status-active {
-            background: #e8f5e8;
-            color: #2e7d32;
-        }
-        
-        .status-inactive {
-            background: #ffebee;
-            color: #c62828;
-        }
-        
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 1000;
-        }
-        
-        .modal-content {
-            background: white;
-            margin: 20px auto;
-            padding: 0;
-            border-radius: 10px;
-            width: 90%;
-            max-width: 700px;
-            max-height: 90vh;
-            overflow-y: auto;
-        }
-        
-        .modal-header {
-            padding: 20px;
-            border-bottom: 1px solid #e1e1e1;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .modal-header h2 {
-            color: #004685;
-            margin: 0;
-        }
-        
-        .close {
-            background: none;
             border: none;
-            font-size: 24px;
-            cursor: pointer;
-            color: #666;
+            padding: 15px;
         }
-        
-        .modal-body {
+
+        .table td {
+            padding: 12px 15px;
+            vertical-align: middle;
+            border-color: #eee;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--secondary-color), #3498db);
+            border: none;
+            border-radius: 8px;
+            padding: 10px 25px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
+        }
+
+        .status-badge {
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+
+        .status-active { background-color: var(--success-color); color: white; }
+        .status-inactive { background-color: var(--danger-color); color: white; }
+
+        .modal-header {
+            background: linear-gradient(135deg, var(--primary-color), #34495e);
+            color: white;
+            border-radius: 10px 10px 0 0;
+        }
+
+        .form-control:focus {
+            border-color: var(--secondary-color);
+            box-shadow: 0 0 0 0.2rem rgba(52, 152, 219, 0.25);
+        }
+
+        .search-filters {
+            background: #f8f9fa;
             padding: 20px;
-        }
-        
-        .form-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 15px;
-        }
-        
-        .alert {
-            padding: 12px;
-            border-radius: 5px;
+            border-radius: 10px;
             margin-bottom: 20px;
         }
-        
-        .alert-success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
+
+        .page-header {
+            background: linear-gradient(135deg, var(--primary-color), #34495e);
+            color: white;
+            padding: 30px;
+            border-radius: 15px;
+            margin-bottom: 30px;
         }
-        
-        .alert-danger {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        
-        @media (max-width: 768px) {
-            .filter-form {
-                grid-template-columns: 1fr;
-            }
-            
-            .doctors-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .form-row {
-                grid-template-columns: 1fr;
-            }
-            
-            .doctor-info {
-                grid-template-columns: 1fr;
-            }
-            
-            .header {
-                flex-direction: column;
-                gap: 15px;
-                text-align: center;
-            }
+
+        .action-buttons .btn {
+            margin: 0 2px;
+            padding: 5px 10px;
+            border-radius: 5px;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>Doctor Management</h1>
-            <div>
-                <a href="dashboard.php" class="btn btn-secondary">← Back to Dashboard</a>
-                <button onclick="openModal()" class="btn btn-primary">+ Add New Doctor</button>
-            </div>
-        </div>
-        
-        <?php if ($message): ?>
-            <div class="alert <?php echo strpos($message, 'Error') === 0 ? 'alert-danger' : 'alert-success'; ?>">
-                <?php echo htmlspecialchars($message); ?>
-            </div>
-        <?php endif; ?>
-        
-        <div class="search-filters">
-            <form method="GET" class="filter-form">
-                <div class="form-group">
-                    <label for="search">Search Doctors</label>
-                    <input type="text" name="search" id="search" placeholder="Search by name, employee ID, or specialization..." 
-                           value="<?php echo htmlspecialchars($search); ?>">
+    <div class="container-fluid">
+        <div class="row">
+            <!-- Sidebar -->
+            <div class="col-md-2 sidebar p-0">
+                <div class="p-4">
+                    <h4 class="text-white text-center mb-4">
+                        <i class="fas fa-hospital"></i> HMS
+                    </h4>
                 </div>
-                
-                <div class="form-group">
-                    <label for="department">Department</label>
-                    <select name="department" id="department">
-                        <option value="">All Departments</option>
-                        <?php foreach ($departments as $dept): ?>
-                            <option value="<?php echo $dept['id']; ?>" 
-                                    <?php echo $filter_department == $dept['id'] ? 'selected' : ''; ?>>
-                                <?php echo htmlspecialchars($dept['name']); ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-                
-                <div class="form-group">
-                    <button type="submit" class="btn btn-primary">Search</button>
-                </div>
-                
-                <div class="form-group">
-                    <?php if ($search || $filter_department): ?>
-                        <a href="doctors.php" class="btn btn-secondary">Clear</a>
+                <nav class="nav flex-column">
+                    <a class="nav-link" href="dashboard.php">
+                        <i class="fas fa-dashboard me-2"></i> Dashboard
+                    </a>
+                    <a class="nav-link" href="patients.php">
+                        <i class="fas fa-user-injured me-2"></i> Patients
+                    </a>
+                    <a class="nav-link active" href="doctors.php">
+                        <i class="fas fa-user-md me-2"></i> Doctors
+                    </a>
+                    <?php if (in_array($_SESSION['role'], ['admin', 'nurse', 'receptionist'])): ?>
+                    <a class="nav-link" href="appointments.php">
+                        <i class="fas fa-calendar-check me-2"></i> Appointments
+                    </a>
                     <?php endif; ?>
-                </div>
-            </form>
-        </div>
-        
-        <div class="doctors-grid">
-            <?php if (empty($doctors)): ?>
-                <div style="grid-column: 1 / -1; text-align: center; padding: 50px; color: #666;">
-                    <h3>No doctors found</h3>
-                    <p>Add your first doctor to get started.</p>
-                </div>
-            <?php else: ?>
-                <?php foreach ($doctors as $doctor): ?>
-                    <div class="doctor-card">
-                        <div class="doctor-header">
-                            <h3>Dr. <?php echo htmlspecialchars($doctor['full_name']); ?></h3>
-                            <p><?php echo htmlspecialchars($doctor['specialization'] ?? 'General Practitioner'); ?></p>
-                        </div>
-                        
-                        <div class="doctor-body">
-                            <div class="doctor-info">
-                                <div class="info-item">
-                                    <label>Employee ID</label>
-                                    <span><?php echo htmlspecialchars($doctor['employee_id']); ?></span>
-                                </div>
-                                
-                                <div class="info-item">
-                                    <label>Department</label>
-                                    <span><?php echo htmlspecialchars($doctor['department_name'] ?? 'General'); ?></span>
-                                </div>
-                                
-                                <div class="info-item">
-                                    <label>Experience</label>
-                                    <span><?php echo $doctor['experience_years']; ?> years</span>
-                                </div>
-                                
-                                <div class="info-item">
-                                    <label>Consultation Fee</label>
-                                    <span>₹<?php echo number_format($doctor['consultation_fee'], 2); ?></span>
-                                </div>
-                                
-                                <div class="info-item">
-                                    <label>Phone</label>
-                                    <span><?php echo htmlspecialchars($doctor['phone']); ?></span>
-                                </div>
-                                
-                                <div class="info-item">
-                                    <label>Status</label>
-                                    <span class="status-badge <?php echo $doctor['is_available'] ? 'status-active' : 'status-inactive'; ?>">
-                                        <?php echo $doctor['is_available'] ? 'Active' : 'Inactive'; ?>
-                                    </span>
-                                </div>
-                            </div>
-                            
-                            <div class="doctor-stats">
-                                <div class="stat">
-                                    <div class="number"><?php echo $doctor['total_appointments']; ?></div>
-                                    <div class="label">Total Appointments</div>
-                                </div>
-                                <div class="stat">
-                                    <div class="number"><?php echo $doctor['today_appointments']; ?></div>
-                                    <div class="label">Today</div>
-                                </div>
-                            </div>
-                            
-                            <div class="doctor-actions">
-                                <form method="POST" style="display: inline;">
-                                    <input type="hidden" name="action" value="toggle_status">
-                                    <input type="hidden" name="doctor_id" value="<?php echo $doctor['id']; ?>">
-                                    <input type="hidden" name="new_status" value="<?php echo $doctor['is_available'] ? '0' : '1'; ?>">
-                                    <button type="submit" class="btn <?php echo $doctor['is_available'] ? 'btn-danger' : 'btn-success'; ?> btn-sm">
-                                        <?php echo $doctor['is_available'] ? 'Deactivate' : 'Activate'; ?>
-                                    </button>
-                                </form>
-                                <a href="doctor-details.php?id=<?php echo $doctor['id']; ?>" class="btn btn-primary btn-sm">View Details</a>
-                            </div>
-                        </div>
-                    </div>
-                <?php endforeach; ?>
-            <?php endif; ?>
-        </div>
-    </div>
-    
-    <!-- Add Doctor Modal -->
-    <div id="doctorModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Add New Doctor</h2>
-                <button type="button" class="close" onclick="closeModal()">&times;</button>
+                    <?php if (in_array($_SESSION['role'], ['admin', 'pharmacist'])): ?>
+                    <a class="nav-link" href="pharmacy.php">
+                        <i class="fas fa-pills me-2"></i> Pharmacy
+                    </a>
+                    <?php endif; ?>
+                    <?php if (in_array($_SESSION['role'], ['admin', 'lab_technician'])): ?>
+                    <a class="nav-link" href="laboratory.php">
+                        <i class="fas fa-flask me-2"></i> Laboratory
+                    </a>
+                    <?php endif; ?>
+                    <?php if (in_array($_SESSION['role'], ['admin', 'nurse'])): ?>
+                    <a class="nav-link" href="blood-bank.php">
+                        <i class="fas fa-tint me-2"></i> Blood Bank
+                    </a>
+                    <a class="nav-link" href="organ-donation.php">
+                        <i class="fas fa-heart me-2"></i> Organ Donation
+                    </a>
+                    <?php endif; ?>
+                    <?php if (in_array($_SESSION['role'], ['admin', 'accountant'])): ?>
+                    <a class="nav-link" href="billing.php">
+                        <i class="fas fa-file-invoice-dollar me-2"></i> Billing
+                    </a>
+                    <?php endif; ?>
+                    <?php if (isAdmin()): ?>
+                    <a class="nav-link" href="rooms-beds.php">
+                        <i class="fas fa-bed me-2"></i> Rooms & Beds
+                    </a>
+                    <a class="nav-link" href="users.php">
+                        <i class="fas fa-users me-2"></i> Users
+                    </a>
+                    <a class="nav-link" href="reports.php">
+                        <i class="fas fa-chart-bar me-2"></i> Reports
+                    </a>
+                    <?php endif; ?>
+                    <a class="nav-link" href="logout.php">
+                        <i class="fas fa-sign-out-alt me-2"></i> Logout
+                    </a>
+                </nav>
             </div>
-            <div class="modal-body">
-                <form method="POST">
-                    <input type="hidden" name="action" value="add_doctor">
-                    
-                    <h3 style="color: #004685; margin-bottom: 15px;">Personal Information</h3>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="first_name">First Name *</label>
-                            <input type="text" id="first_name" name="first_name" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="last_name">Last Name *</label>
-                            <input type="text" id="last_name" name="last_name" required>
-                        </div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="middle_name">Middle Name</label>
-                        <input type="text" id="middle_name" name="middle_name">
-                    </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="phone">Phone Number *</label>
-                            <input type="tel" id="phone" name="phone" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="emergency_contact">Emergency Contact</label>
-                            <input type="tel" id="emergency_contact" name="emergency_contact">
+
+            <!-- Main Content -->
+            <div class="col-md-10">
+                <div class="main-content">
+                    <!-- Page Header -->
+                    <div class="page-header">
+                        <div class="row align-items-center">
+                            <div class="col">
+                                <h2 class="mb-0">
+                                    <i class="fas fa-user-md me-3"></i>Doctors Management
+                                </h2>
+                                <p class="mb-0 mt-2">Manage doctor profiles and information</p>
+                            </div>
+                            <?php if (in_array($_SESSION['role'], $manageRoles)): ?>
+                            <div class="col-auto">
+                                <button class="btn btn-light" data-bs-toggle="modal" data-bs-target="#addDoctorModal">
+                                    <i class="fas fa-plus me-2"></i>Add New Doctor
+                                </button>
+                            </div>
+                            <?php endif; ?>
                         </div>
                     </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="email">Email Address *</label>
-                            <input type="email" id="email" name="email" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="password">Password *</label>
-                            <input type="password" id="password" name="password" required>
-                        </div>
+
+                    <!-- Alert Messages -->
+                    <?php if ($message): ?>
+                    <div class="alert alert-<?php echo $messageType == 'success' ? 'success' : 'danger'; ?> alert-dismissible fade show">
+                        <i class="fas fa-<?php echo $messageType == 'success' ? 'check-circle' : 'exclamation-triangle'; ?> me-2"></i>
+                        <?php echo htmlspecialchars($message); ?>
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
                     </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="date_of_birth">Date of Birth</label>
-                            <input type="date" id="date_of_birth" name="date_of_birth">
-                        </div>
-                        <div class="form-group">
-                            <label for="gender">Gender</label>
-                            <select id="gender" name="gender">
-                                <option value="">Select Gender</option>
-                                <option value="male">Male</option>
-                                <option value="female">Female</option>
-                                <option value="other">Other</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="address">Address</label>
-                        <textarea id="address" name="address"></textarea>
-                    </div>
-                    
-                    <h3 style="color: #004685; margin: 20px 0 15px;">Professional Information</h3>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="specialization">Specialization *</label>
-                            <input type="text" id="specialization" name="specialization" required>
-                        </div>
-                        <div class="form-group">
-                            <label for="department_id">Department</label>
-                            <select id="department_id" name="department_id">
-                                <option value="">Select Department</option>
-                                <?php foreach ($departments as $dept): ?>
-                                    <option value="<?php echo $dept['id']; ?>">
+                    <?php endif; ?>
+
+                    <!-- Search and Filters -->
+                    <div class="search-filters">
+                        <form method="GET" class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label">Search Doctors</label>
+                                <input type="text" class="form-control" name="search" value="<?php echo htmlspecialchars($search); ?>" placeholder="Name, ID, Email, Phone...">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Department</label>
+                                <select class="form-select" name="department">
+                                    <option value="">All Departments</option>
+                                    <?php foreach ($departments as $dept): ?>
+                                    <option value="<?php echo $dept['id']; ?>" <?php echo $department_filter == $dept['id'] ? 'selected' : ''; ?>>
                                         <?php echo htmlspecialchars($dept['name']); ?>
                                     </option>
-                                <?php endforeach; ?>
-                            </select>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label">Status</label>
+                                <select class="form-select" name="status">
+                                    <option value="">All Status</option>
+                                    <option value="active" <?php echo $status_filter == 'active' ? 'selected' : ''; ?>>Active</option>
+                                    <option value="inactive" <?php echo $status_filter == 'inactive' ? 'selected' : ''; ?>>Inactive</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label">&nbsp;</label>
+                                <div class="d-grid">
+                                    <button type="submit" class="btn btn-primary">
+                                        <i class="fas fa-search"></i> Search
+                                    </button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+
+                    <!-- Doctors Table -->
+                    <div class="table-container">
+                        <div class="table-responsive">
+                            <table class="table table-hover mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Employee ID</th>
+                                        <th>Name</th>
+                                        <th>Specialization</th>
+                                        <th>Department</th>
+                                        <th>Phone</th>
+                                        <th>Email</th>
+                                        <th>Consultation Fee</th>
+                                        <th>Status</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php if (empty($doctors)): ?>
+                                    <tr>
+                                        <td colspan="9" class="text-center py-4">
+                                            <i class="fas fa-user-md fa-3x text-muted mb-3"></i>
+                                            <h5 class="text-muted">No doctors found</h5>
+                                        </td>
+                                    </tr>
+                                    <?php else: ?>
+                                    <?php foreach ($doctors as $doctor): ?>
+                                    <tr>
+                                        <td><strong><?php echo htmlspecialchars($doctor['employee_id']); ?></strong></td>
+                                        <td>
+                                            <div class="d-flex align-items-center">
+                                                <div class="bg-primary text-white rounded-circle d-flex align-items-center justify-content-center me-3" style="width: 40px; height: 40px;">
+                                                    <i class="fas fa-user-md"></i>
+                                                </div>
+                                                <div>
+                                                    <strong><?php echo htmlspecialchars($doctor['name']); ?></strong>
+                                                    <small class="d-block text-muted"><?php echo htmlspecialchars($doctor['qualification']); ?></small>
+                                                </div>
+                                            </div>
+                                        </td>
+                                        <td><?php echo htmlspecialchars($doctor['specialization']); ?></td>
+                                        <td><?php echo htmlspecialchars($doctor['department_name'] ?? 'N/A'); ?></td>
+                                        <td><?php echo htmlspecialchars($doctor['phone']); ?></td>
+                                        <td><?php echo htmlspecialchars($doctor['email']); ?></td>
+                                        <td><?php echo formatCurrency($doctor['consultation_fee']); ?></td>
+                                        <td>
+                                            <span class="status-badge status-<?php echo $doctor['status']; ?>">
+                                                <?php echo ucfirst($doctor['status']); ?>
+                                            </span>
+                                        </td>
+                                        <td>
+                                            <div class="action-buttons">
+                                                <button class="btn btn-sm btn-info" onclick="viewDoctor(<?php echo $doctor['id']; ?>)" title="View Details">
+                                                    <i class="fas fa-eye"></i>
+                                                </button>
+                                                <?php if (in_array($_SESSION['role'], $manageRoles)): ?>
+                                                <button class="btn btn-sm btn-warning" onclick="editDoctor(<?php echo $doctor['id']; ?>)" title="Edit">
+                                                    <i class="fas fa-edit"></i>
+                                                </button>
+                                                <button class="btn btn-sm btn-danger" onclick="deleteDoctor(<?php echo $doctor['id']; ?>, '<?php echo htmlspecialchars($doctor['name']); ?>')" title="Delete">
+                                                    <i class="fas fa-trash"></i>
+                                                </button>
+                                                <?php endif; ?>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                    <?php endforeach; ?>
+                                    <?php endif; ?>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
-                    
-                    <div class="form-group">
-                        <label for="qualification">Qualification *</label>
-                        <textarea id="qualification" name="qualification" placeholder="MBBS, MD, etc." required></textarea>
-                    </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="experience_years">Experience (Years) *</label>
-                            <input type="number" id="experience_years" name="experience_years" min="0" required>
+
+                    <!-- Pagination -->
+                    <?php if ($totalPages > 1): ?>
+                    <nav class="mt-4">
+                        <ul class="pagination justify-content-center">
+                            <?php
+                            $queryParams = $_GET;
+                            for ($i = 1; $i <= $totalPages; $i++):
+                                $queryParams['page'] = $i;
+                                $url = '?' . http_build_query($queryParams);
+                            ?>
+                            <li class="page-item <?php echo $i == $page ? 'active' : ''; ?>">
+                                <a class="page-link" href="<?php echo $url; ?>"><?php echo $i; ?></a>
+                            </li>
+                            <?php endfor; ?>
+                        </ul>
+                    </nav>
+                    <?php endif; ?>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Doctor Modal -->
+    <?php if (in_array($_SESSION['role'], $manageRoles)): ?>
+    <div class="modal fade" id="addDoctorModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-user-md me-2"></i>Add New Doctor
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST">
+                    <div class="modal-body">
+                        <input type="hidden" name="action" value="add_doctor">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Employee ID *</label>
+                                <input type="text" class="form-control" name="employee_id" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Full Name *</label>
+                                <input type="text" class="form-control" name="name" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Email *</label>
+                                <input type="email" class="form-control" name="email" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Phone *</label>
+                                <input type="text" class="form-control" name="phone" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Specialization *</label>
+                                <input type="text" class="form-control" name="specialization" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Department *</label>
+                                <select class="form-select" name="department_id" required>
+                                    <option value="">Select Department</option>
+                                    <?php foreach ($departments as $dept): ?>
+                                    <option value="<?php echo $dept['id']; ?>"><?php echo htmlspecialchars($dept['name']); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Qualification *</label>
+                                <input type="text" class="form-control" name="qualification" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Experience (Years)</label>
+                                <input type="number" class="form-control" name="experience" min="0">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Consultation Fee</label>
+                                <input type="number" class="form-control" name="consultation_fee" step="0.01" min="0">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Date of Birth</label>
+                                <input type="date" class="form-control" name="date_of_birth">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Gender</label>
+                                <select class="form-select" name="gender">
+                                    <option value="">Select Gender</option>
+                                    <option value="Male">Male</option>
+                                    <option value="Female">Female</option>
+                                    <option value="Other">Other</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">License Number</label>
+                                <input type="text" class="form-control" name="license_number">
+                            </div>
+                            <div class="col-md-12 mb-3">
+                                <label class="form-label">Address</label>
+                                <textarea class="form-control" name="address" rows="3"></textarea>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Emergency Contact</label>
+                                <input type="text" class="form-control" name="emergency_contact">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Status</label>
+                                <select class="form-select" name="status">
+                                    <option value="active">Active</option>
+                                    <option value="inactive">Inactive</option>
+                                </select>
+                            </div>
                         </div>
-                        <div class="form-group">
-                            <label for="consultation_fee">Consultation Fee (₹) *</label>
-                            <input type="number" id="consultation_fee" name="consultation_fee" min="0" step="0.01" required>
-                        </div>
                     </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="registration_number">Registration Number</label>
-                            <input type="text" id="registration_number" name="registration_number">
-                        </div>
-                        <div class="form-group">
-                            <label for="blood_group">Blood Group</label>
-                            <select id="blood_group" name="blood_group">
-                                <option value="">Select Blood Group</option>
-                                <option value="A+">A+</option>
-                                <option value="A-">A-</option>
-                                <option value="B+">B+</option>
-                                <option value="B-">B-</option>
-                                <option value="AB+">AB+</option>
-                                <option value="AB-">AB-</option>
-                                <option value="O+">O+</option>
-                                <option value="O-">O-</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label for="joined_date">Joining Date *</label>
-                        <input type="date" id="joined_date" name="joined_date" value="<?php echo date('Y-m-d'); ?>" required>
-                    </div>
-                    
-                    <div style="text-align: right; margin-top: 30px;">
-                        <button type="button" onclick="closeModal()" class="btn btn-secondary">Cancel</button>
-                        <button type="submit" class="btn btn-primary">Add Doctor</button>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save me-2"></i>Add Doctor
+                        </button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
-    
+
+    <!-- Edit Doctor Modal -->
+    <div class="modal fade" id="editDoctorModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-edit me-2"></i>Edit Doctor
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST" id="editDoctorForm">
+                    <div class="modal-body">
+                        <input type="hidden" name="action" value="update_doctor">
+                        <input type="hidden" name="id" id="edit_doctor_id">
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Employee ID *</label>
+                                <input type="text" class="form-control" name="employee_id" id="edit_employee_id" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Full Name *</label>
+                                <input type="text" class="form-control" name="name" id="edit_name" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Email *</label>
+                                <input type="email" class="form-control" name="email" id="edit_email" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Phone *</label>
+                                <input type="text" class="form-control" name="phone" id="edit_phone" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Specialization *</label>
+                                <input type="text" class="form-control" name="specialization" id="edit_specialization" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Department *</label>
+                                <select class="form-select" name="department_id" id="edit_department_id" required>
+                                    <option value="">Select Department</option>
+                                    <?php foreach ($departments as $dept): ?>
+                                    <option value="<?php echo $dept['id']; ?>"><?php echo htmlspecialchars($dept['name']); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Qualification *</label>
+                                <input type="text" class="form-control" name="qualification" id="edit_qualification" required>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Experience (Years)</label>
+                                <input type="number" class="form-control" name="experience" id="edit_experience" min="0">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Consultation Fee</label>
+                                <input type="number" class="form-control" name="consultation_fee" id="edit_consultation_fee" step="0.01" min="0">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Date of Birth</label>
+                                <input type="date" class="form-control" name="date_of_birth" id="edit_date_of_birth">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Gender</label>
+                                <select class="form-select" name="gender" id="edit_gender">
+                                    <option value="">Select Gender</option>
+                                    <option value="Male">Male</option>
+                                    <option value="Female">Female</option>
+                                    <option value="Other">Other</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">License Number</label>
+                                <input type="text" class="form-control" name="license_number" id="edit_license_number">
+                            </div>
+                            <div class="col-md-12 mb-3">
+                                <label class="form-label">Address</label>
+                                <textarea class="form-control" name="address" id="edit_address" rows="3"></textarea>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Emergency Contact</label>
+                                <input type="text" class="form-control" name="emergency_contact" id="edit_emergency_contact">
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Status</label>
+                                <select class="form-select" name="status" id="edit_status">
+                                    <option value="active">Active</option>
+                                    <option value="inactive">Inactive</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save me-2"></i>Update Doctor
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- View Doctor Modal -->
+    <div class="modal fade" id="viewDoctorModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-eye me-2"></i>Doctor Details
+                    </h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="viewDoctorContent">
+                    <!-- Content will be loaded via JavaScript -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        function openModal() {
-            document.getElementById('doctorModal').style.display = 'block';
+        // Edit Doctor
+        function editDoctor(id) {
+            fetch(`get-doctor-details.php?id=${id}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        const doctor = data.doctor;
+                        document.getElementById('edit_doctor_id').value = doctor.id;
+                        document.getElementById('edit_employee_id').value = doctor.employee_id;
+                        document.getElementById('edit_name').value = doctor.name;
+                        document.getElementById('edit_email').value = doctor.email;
+                        document.getElementById('edit_phone').value = doctor.phone;
+                        document.getElementById('edit_specialization').value = doctor.specialization;
+                        document.getElementById('edit_department_id').value = doctor.department_id;
+                        document.getElementById('edit_qualification').value = doctor.qualification;
+                        document.getElementById('edit_experience').value = doctor.experience;
+                        document.getElementById('edit_consultation_fee').value = doctor.consultation_fee;
+                        document.getElementById('edit_date_of_birth').value = doctor.date_of_birth;
+                        document.getElementById('edit_gender').value = doctor.gender;
+                        document.getElementById('edit_license_number').value = doctor.license_number;
+                        document.getElementById('edit_address').value = doctor.address;
+                        document.getElementById('edit_emergency_contact').value = doctor.emergency_contact;
+                        document.getElementById('edit_status').value = doctor.status;
+                        
+                        new bootstrap.Modal(document.getElementById('editDoctorModal')).show();
+                    } else {
+                        alert('Error loading doctor details');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Error loading doctor details');
+                });
         }
-        
-        function closeModal() {
-            document.getElementById('doctorModal').style.display = 'none';
+
+        // View Doctor
+        function viewDoctor(id) {
+            fetch(`get-doctor-details.php?id=${id}&view=true`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('viewDoctorContent').innerHTML = data.html;
+                        new bootstrap.Modal(document.getElementById('viewDoctorModal')).show();
+                    } else {
+                        alert('Error loading doctor details');
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('Error loading doctor details');
+                });
         }
-        
-        // Close modal when clicking outside
-        window.onclick = function(event) {
-            const modal = document.getElementById('doctorModal');
-            if (event.target === modal) {
-                closeModal();
+
+        // Delete Doctor
+        function deleteDoctor(id, name) {
+            if (confirm(`Are you sure you want to delete Dr. ${name}?`)) {
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.innerHTML = `
+                    <input type="hidden" name="action" value="delete_doctor">
+                    <input type="hidden" name="id" value="${id}">
+                `;
+                document.body.appendChild(form);
+                form.submit();
             }
         }
     </script>

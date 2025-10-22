@@ -1,935 +1,669 @@
 <?php
 session_start();
 require_once 'config/database.php';
+require_once 'includes/auth.php';
+require_once 'includes/functions.php';
 
-// Check if user is logged in and has permission
-if (!isset($_SESSION['user_id'])) {
-    header('Location: index.php');
-    exit;
-}
+requireLogin();
+requireRole(['admin', 'accountant', 'receptionist']);
 
-$user_role = $_SESSION['role'];
-if (!in_array($user_role, ['admin', 'receptionist'])) {
-    header('Location: dashboard.php');
-    exit;
-}
-
-$db = new Database();
+$db = Database::getInstance();
 $message = '';
+$error = '';
 
-// Handle bill creation
-if ($_POST && isset($_POST['action']) && $_POST['action'] === 'create_bill') {
-    try {
-        $db->getConnection()->beginTransaction();
-        
-        // Generate bill number
-        $bill_number = 'BILL' . date('Ymd') . sprintf('%04d', rand(1000, 9999));
-        
-        // Calculate totals
-        $subtotal = 0;
-        if (isset($_POST['items']) && is_array($_POST['items'])) {
-            foreach ($_POST['items'] as $item) {
-                if (!empty($item['name']) && !empty($item['quantity']) && !empty($item['price'])) {
-                    $subtotal += (float)$item['quantity'] * (float)$item['price'];
+// Handle form submissions
+if ($_POST) {
+    $action = $_POST['action'] ?? '';
+    
+    if ($action === 'create_bill') {
+        try {
+            $db->beginTransaction();
+            
+            $bill_number = generateBillNumber();
+            $patient_id = $_POST['patient_id'];
+            $appointment_id = $_POST['appointment_id'] ?: null;
+            $bill_date = $_POST['bill_date'];
+            $due_date = $_POST['due_date'];
+            $payment_terms = sanitizeInput($_POST['payment_terms']);
+            $notes = sanitizeInput($_POST['notes']);
+            $discount_amount = (float)($_POST['discount_amount'] ?? 0);
+            $tax_rate = (float)($_POST['tax_rate'] ?? 0);
+            
+            // Calculate totals
+            $subtotal = 0;
+            $services = $_POST['services'] ?? [];
+            $quantities = $_POST['quantities'] ?? [];
+            $unit_prices = $_POST['unit_prices'] ?? [];
+            
+            // Insert bill
+            $billId = $db->query("
+                INSERT INTO bills (
+                    bill_number, patient_id, appointment_id, bill_date, due_date,
+                    subtotal, tax_amount, discount_amount, total_amount, balance_amount,
+                    payment_terms, notes, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ", [
+                $bill_number, $patient_id, $appointment_id, $bill_date, $due_date,
+                0, 0, $discount_amount, 0, 0, $payment_terms, $notes, getCurrentUserId()
+            ]);
+            $billId = $db->lastInsertId();
+            
+            // Add bill items
+            foreach ($services as $index => $service_id) {
+                if (!empty($service_id) && !empty($quantities[$index]) && !empty($unit_prices[$index])) {
+                    $quantity = (int)$quantities[$index];
+                    $unit_price = (float)$unit_prices[$index];
+                    $total_price = $quantity * $unit_price;
+                    $subtotal += $total_price;
+                    
+                    // Get service details
+                    $service = $db->query("SELECT service_name FROM services WHERE id = ?", [$service_id])->fetch();
+                    $item_name = $service['service_name'] ?? 'Service';
+                    
+                    $db->query("
+                        INSERT INTO bill_items (bill_id, service_id, item_name, quantity, unit_price, total_price)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ", [$billId, $service_id, $item_name, $quantity, $unit_price, $total_price]);
                 }
             }
+            
+            // Update bill totals
+            $tax_amount = ($subtotal * $tax_rate) / 100;
+            $total_amount = $subtotal + $tax_amount - $discount_amount;
+            
+            $db->query("
+                UPDATE bills SET 
+                    subtotal = ?, tax_amount = ?, total_amount = ?, balance_amount = ?
+                WHERE id = ?
+            ", [$subtotal, $tax_amount, $total_amount, $total_amount, $billId]);
+            
+            $db->commit();
+            
+            logActivity(getCurrentUserId(), 'Bill Created', "Created bill: $bill_number for patient ID: $patient_id");
+            $message = "Bill created successfully!";
+            
+        } catch (Exception $e) {
+            $db->rollback();
+            $error = "Error creating bill: " . $e->getMessage();
         }
-        
-        $discount = (float)($_POST['discount_amount'] ?? 0);
-        $tax_rate = 18; // GST 18%
-        $tax_amount = ($subtotal - $discount) * ($tax_rate / 100);
-        $total_amount = $subtotal - $discount + $tax_amount;
-        
-        // Insert bill
-        $bill_sql = "INSERT INTO bills (hospital_id, patient_id, visit_id, bill_number, bill_date, bill_type, subtotal, discount_amount, tax_amount, total_amount, balance_amount, payment_status, notes, created_by) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)";
-        
-        $db->query($bill_sql, [
-            $_POST['patient_id'],
-            $_POST['visit_id'] ?: null,
-            $bill_number,
-            $_POST['bill_date'],
-            $_POST['bill_type'],
-            $subtotal,
-            $discount,
-            $tax_amount,
-            $total_amount,
-            $total_amount, // Initially balance = total
-            $_POST['notes'],
-            $_SESSION['user_id']
-        ]);
-        
-        $bill_id = $db->lastInsertId();
-        
-        // Insert bill items
-        if (isset($_POST['items']) && is_array($_POST['items'])) {
-            foreach ($_POST['items'] as $item) {
-                if (!empty($item['name']) && !empty($item['quantity']) && !empty($item['price'])) {
-                    $item_total = (float)$item['quantity'] * (float)$item['price'];
-                    $item_discount = (float)($item['discount'] ?? 0);
-                    $item_final = $item_total - $item_discount;
-                    
-                    $item_sql = "INSERT INTO bill_items (bill_id, item_type, item_name, item_code, quantity, unit_price, total_price, discount_amount, final_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                    
-                    $db->query($item_sql, [
-                        $bill_id,
-                        $item['type'],
-                        $item['name'],
-                        $item['code'] ?? '',
-                        $item['quantity'],
-                        $item['price'],
-                        $item_total,
-                        $item_discount,
-                        $item_final
-                    ]);
-                }
-            }
-        }
-        
-        $db->getConnection()->commit();
-        $message = "Bill created successfully! Bill Number: " . $bill_number;
-        
-    } catch (Exception $e) {
-        $db->getConnection()->rollBack();
-        $message = "Error: " . $e->getMessage();
     }
-}
-
-// Handle payment recording
-if ($_POST && isset($_POST['action']) && $_POST['action'] === 'record_payment') {
-    try {
-        $bill_id = $_POST['bill_id'];
-        $payment_amount = (float)$_POST['payment_amount'];
-        $payment_method = $_POST['payment_method'];
-        
-        // Get current bill details
-        $bill = $db->query("SELECT * FROM bills WHERE id = ?", [$bill_id])->fetch();
-        
-        if ($bill) {
-            $new_paid_amount = $bill['paid_amount'] + $payment_amount;
+    
+    if ($action === 'record_payment') {
+        try {
+            $bill_id = $_POST['bill_id'];
+            $amount = (float)$_POST['amount'];
+            $payment_method = $_POST['payment_method'];
+            $payment_date = $_POST['payment_date'];
+            $transaction_id = sanitizeInput($_POST['transaction_id']);
+            $reference_number = sanitizeInput($_POST['reference_number']);
+            $notes = sanitizeInput($_POST['notes']);
+            
+            $payment_id = 'PAY' . date('Y') . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
+            
+            // Insert payment
+            $db->query("
+                INSERT INTO payments (
+                    payment_id, bill_id, amount, payment_method, payment_date,
+                    transaction_id, reference_number, notes, received_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ", [
+                $payment_id, $bill_id, $amount, $payment_method, $payment_date,
+                $transaction_id, $reference_number, $notes, getCurrentUserId()
+            ]);
+            
+            // Update bill balance
+            $bill = $db->query("SELECT total_amount, paid_amount FROM bills WHERE id = ?", [$bill_id])->fetch();
+            $new_paid_amount = $bill['paid_amount'] + $amount;
             $new_balance = $bill['total_amount'] - $new_paid_amount;
+            $new_status = $new_balance <= 0 ? 'Paid' : 'Partially Paid';
             
-            // Determine payment status
-            $payment_status = 'partial';
-            if ($new_balance <= 0) {
-                $payment_status = 'paid';
-                $new_balance = 0;
-            } elseif ($new_paid_amount == 0) {
-                $payment_status = 'pending';
-            }
+            $db->query("
+                UPDATE bills SET 
+                    paid_amount = ?, balance_amount = ?, status = ?
+                WHERE id = ?
+            ", [$new_paid_amount, $new_balance, $new_status, $bill_id]);
             
-            // Update bill
-            $db->query(
-                "UPDATE bills SET paid_amount = ?, balance_amount = ?, payment_status = ?, payment_method = ?, updated_at = NOW() WHERE id = ?",
-                [$new_paid_amount, $new_balance, $payment_status, $payment_method, $bill_id]
-            );
-            
+            logActivity(getCurrentUserId(), 'Payment Recorded', "Recorded payment: $payment_id for bill ID: $bill_id");
             $message = "Payment recorded successfully!";
+            
+        } catch (Exception $e) {
+            $error = "Error recording payment: " . $e->getMessage();
         }
-    } catch (Exception $e) {
-        $message = "Error: " . $e->getMessage();
     }
 }
 
-// Get bills with search and filters
+// Get bills with search and pagination
 $search = $_GET['search'] ?? '';
-$filter_status = $_GET['status'] ?? '';
-$filter_date_from = $_GET['date_from'] ?? '';
-$filter_date_to = $_GET['date_to'] ?? '';
+$status_filter = $_GET['status'] ?? '';
+$page = (int)($_GET['page'] ?? 1);
+$limit = 20;
+$offset = ($page - 1) * $limit;
 
-$sql = "SELECT b.*, 
-        CONCAT(p.first_name, ' ', p.last_name) as patient_name,
-        p.patient_id,
-        p.phone as patient_phone
-        FROM bills b
-        JOIN patients p ON b.patient_id = p.id
-        WHERE b.hospital_id = 1";
-
-$params = [];
+$searchCondition = '';
+$searchParams = [];
 
 if ($search) {
-    $sql .= " AND (b.bill_number LIKE ? OR p.first_name LIKE ? OR p.last_name LIKE ? OR p.patient_id LIKE ?)";
-    $search_param = "%$search%";
-    $params = array_fill(0, 4, $search_param);
+    $searchCondition .= " AND (b.bill_number LIKE ? OR p.first_name LIKE ? OR p.last_name LIKE ? OR p.patient_id LIKE ?)";
+    $searchTerm = "%$search%";
+    $searchParams = array_merge($searchParams, [$searchTerm, $searchTerm, $searchTerm, $searchTerm]);
 }
 
-if ($filter_status) {
-    $sql .= " AND b.payment_status = ?";
-    $params[] = $filter_status;
+if ($status_filter) {
+    $searchCondition .= " AND b.status = ?";
+    $searchParams[] = $status_filter;
 }
 
-if ($filter_date_from) {
-    $sql .= " AND b.bill_date >= ?";
-    $params[] = $filter_date_from;
-}
+$bills = $db->query("
+    SELECT b.*, 
+           CONCAT(p.first_name, ' ', p.last_name) as patient_name,
+           p.patient_id,
+           p.phone as patient_phone
+    FROM bills b
+    JOIN patients p ON b.patient_id = p.id
+    WHERE 1=1 $searchCondition
+    ORDER BY b.created_at DESC 
+    LIMIT $limit OFFSET $offset
+", $searchParams)->fetchAll();
 
-if ($filter_date_to) {
-    $sql .= " AND b.bill_date <= ?";
-    $params[] = $filter_date_to;
-}
+$totalBills = $db->query("
+    SELECT COUNT(*) as count FROM bills b
+    JOIN patients p ON b.patient_id = p.id
+    WHERE 1=1 $searchCondition
+", $searchParams)->fetch()['count'];
 
-$sql .= " ORDER BY b.created_at DESC";
+$totalPages = ceil($totalBills / $limit);
 
-$bills = $db->query($sql, $params)->fetchAll();
+// Get services for dropdown
+$services = $db->query("SELECT * FROM services WHERE is_active = 1 ORDER BY service_name")->fetchAll();
 
-// Get patients for bill creation
-$patients = $db->query("
-    SELECT id, patient_id, CONCAT(first_name, ' ', last_name) as full_name, phone 
-    FROM patients 
-    WHERE hospital_id = 1 
-    ORDER BY first_name, last_name
-")->fetchAll();
+// Get patients for dropdown
+$patients = $db->query("SELECT id, patient_id, first_name, last_name FROM patients WHERE is_active = 1 ORDER BY first_name")->fetchAll();
 
-// Get billing statistics
-$stats = [];
-try {
-    $stats['total_bills'] = $db->query("SELECT COUNT(*) as count FROM bills WHERE hospital_id = 1")->fetch()['count'];
-    $stats['pending_amount'] = $db->query("SELECT SUM(balance_amount) as amount FROM bills WHERE hospital_id = 1 AND payment_status != 'paid'")->fetch()['amount'] ?? 0;
-    $stats['today_revenue'] = $db->query("SELECT SUM(paid_amount) as amount FROM bills WHERE hospital_id = 1 AND DATE(updated_at) = CURDATE()")->fetch()['amount'] ?? 0;
-    $stats['monthly_revenue'] = $db->query("SELECT SUM(paid_amount) as amount FROM bills WHERE hospital_id = 1 AND MONTH(updated_at) = MONTH(CURDATE()) AND YEAR(updated_at) = YEAR(CURDATE())")->fetch()['amount'] ?? 0;
-} catch (Exception $e) {
-    $stats = ['total_bills' => 0, 'pending_amount' => 0, 'today_revenue' => 0, 'monthly_revenue' => 0];
+// Get bill for payment
+$paymentBill = null;
+if (isset($_GET['pay'])) {
+    $paymentBill = $db->query("
+        SELECT b.*, CONCAT(p.first_name, ' ', p.last_name) as patient_name
+        FROM bills b
+        JOIN patients p ON b.patient_id = p.id
+        WHERE b.id = ?
+    ", [$_GET['pay']])->fetch();
 }
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Billing Management - Hospital CRM</title>
+    <title>Billing Management - Hospital System</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: 'Poppins', sans-serif;
-            background: #f5f7fa;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        .header {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .header h1 {
-            color: #004685;
-            font-size: 24px;
-        }
-        
-        .btn {
-            padding: 10px 20px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            text-decoration: none;
-            display: inline-block;
-            font-size: 14px;
-            transition: background 0.3s;
-        }
-        
-        .btn-primary {
-            background: #004685;
-            color: white;
-        }
-        
-        .btn-primary:hover {
-            background: #003366;
-        }
-        
-        .btn-secondary {
-            background: #6c757d;
-            color: white;
-        }
-        
-        .btn-success {
-            background: #28a745;
-            color: white;
-        }
-        
-        .btn-warning {
-            background: #ffc107;
-            color: #333;
-        }
-        
-        .btn-sm {
-            padding: 5px 10px;
-            font-size: 12px;
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .stat-card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            text-align: center;
-        }
-        
-        .stat-card h3 {
-            font-size: 24px;
-            color: #004685;
-            margin-bottom: 5px;
-        }
-        
-        .stat-card p {
-            color: #666;
-            font-size: 14px;
-        }
-        
-        .filters {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            margin-bottom: 20px;
-        }
-        
-        .filter-form {
-            display: grid;
-            grid-template-columns: 2fr 1fr 1fr 1fr auto;
-            gap: 15px;
-            align-items: end;
-        }
-        
-        .form-group {
-            margin-bottom: 15px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 5px;
-            color: #333;
-            font-weight: 500;
-            font-size: 14px;
-        }
-        
-        .form-group input, .form-group select, .form-group textarea {
-            width: 100%;
-            padding: 10px;
-            border: 2px solid #e1e1e1;
-            border-radius: 5px;
-            font-size: 14px;
-        }
-        
-        .bills-table {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-        
-        .table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        
-        .table th, .table td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #e1e1e1;
-        }
-        
-        .table th {
-            background: #f8f9fa;
-            font-weight: 600;
-            color: #333;
-            font-size: 14px;
-        }
-        
-        .table tr:hover {
-            background: #f8f9fa;
-        }
-        
-        .badge {
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 500;
-            text-transform: uppercase;
-        }
-        
-        .badge-pending {
-            background: #fff3cd;
-            color: #856404;
-        }
-        
-        .badge-partial {
-            background: #cce5ff;
-            color: #004085;
-        }
-        
-        .badge-paid {
-            background: #d4edda;
-            color: #155724;
-        }
-        
-        .badge-refunded {
-            background: #f8d7da;
-            color: #721c24;
-        }
-        
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 1000;
-        }
-        
-        .modal-content {
-            background: white;
-            margin: 20px auto;
-            padding: 0;
-            border-radius: 10px;
-            width: 90%;
-            max-width: 900px;
-            max-height: 90vh;
-            overflow-y: auto;
-        }
-        
-        .modal-header {
-            padding: 20px;
-            border-bottom: 1px solid #e1e1e1;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .modal-header h2 {
-            color: #004685;
-            margin: 0;
-        }
-        
-        .close {
-            background: none;
-            border: none;
-            font-size: 24px;
-            cursor: pointer;
-            color: #666;
-        }
-        
-        .modal-body {
-            padding: 20px;
-        }
-        
-        .form-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-            margin-bottom: 15px;
-        }
-        
-        .bill-items {
-            border: 1px solid #e1e1e1;
-            border-radius: 5px;
-            padding: 15px;
-            margin: 15px 0;
-        }
-        
-        .item-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr 80px 80px 80px auto;
-            gap: 10px;
-            align-items: center;
-            margin-bottom: 10px;
-        }
-        
-        .item-row input, .item-row select {
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 3px;
-            font-size: 14px;
-        }
-        
-        .bill-summary {
-            background: #f8f9fa;
-            padding: 15px;
-            border-radius: 5px;
-            margin-top: 15px;
-        }
-        
-        .summary-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 5px;
-        }
-        
-        .summary-row.total {
-            font-weight: 600;
-            font-size: 16px;
-            border-top: 1px solid #ddd;
-            padding-top: 10px;
-            margin-top: 10px;
-        }
-        
-        .alert {
-            padding: 12px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-        }
-        
-        .alert-success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-        
-        .alert-danger {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-        
+        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .container-fluid { padding: 2rem; }
+        .card { border: none; border-radius: 15px; box-shadow: 0 0 20px rgba(0,0,0,0.08); margin-bottom: 2rem; }
+        .card-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 15px 15px 0 0; padding: 1.5rem; }
+        .btn { border-radius: 8px; padding: 0.5rem 1.5rem; font-weight: 500; }
+        .btn-primary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none; }
+        .btn-success { background: linear-gradient(135deg, #56ab2f 0%, #a8e6cf 100%); border: none; }
+        .btn-danger { background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%); border: none; }
+        .btn-warning { background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%); border: none; color: #333; }
+        .form-control, .form-select { border-radius: 8px; border: 2px solid #e9ecef; padding: 0.75rem; }
+        .form-control:focus, .form-select:focus { border-color: #667eea; box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25); }
+        .table { background: white; border-radius: 10px; overflow: hidden; }
+        .table th { background: #f8f9fa; border: none; padding: 1rem; font-weight: 600; }
+        .table td { border: none; padding: 1rem; vertical-align: middle; }
+        .badge { padding: 0.5rem 1rem; border-radius: 20px; }
+        .search-box { background: white; border-radius: 10px; padding: 1.5rem; margin-bottom: 2rem; box-shadow: 0 0 10px rgba(0,0,0,0.05); }
+        .bill-card { background: white; border-radius: 10px; padding: 1.5rem; margin-bottom: 1rem; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+        .bill-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+        .bill-number { font-size: 1.2rem; font-weight: 600; color: #2c3e50; }
+        .bill-amount { font-size: 1.5rem; font-weight: 700; }
+        .status-pending { color: #f39c12; }
+        .status-paid { color: #27ae60; }
+        .status-overdue { color: #e74c3c; }
+        .status-partially-paid { color: #3498db; }
+        .item-row { border-bottom: 1px solid #eee; padding: 0.5rem 0; }
+        .item-row:last-child { border-bottom: none; }
         @media (max-width: 768px) {
-            .filter-form {
-                grid-template-columns: 1fr;
-            }
-            
-            .item-row {
-                grid-template-columns: 1fr;
-            }
-            
-            .form-row {
-                grid-template-columns: 1fr;
-            }
-            
-            .header {
-                flex-direction: column;
-                gap: 15px;
-                text-align: center;
-            }
-            
-            .table .hide-mobile {
-                display: none;
-            }
+            .container-fluid { padding: 1rem; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>Billing Management</h1>
+    <div class="container-fluid">
+        <!-- Header -->
+        <div class="d-flex justify-content-between align-items-center mb-4">
             <div>
-                <a href="dashboard.php" class="btn btn-secondary">← Back to Dashboard</a>
-                <button onclick="openBillModal()" class="btn btn-primary">+ Create New Bill</button>
+                <h2><i class="fas fa-file-invoice-dollar text-primary me-2"></i>Billing Management</h2>
+                <p class="text-muted">Manage invoices, bills and payments</p>
+            </div>
+            <div>
+                <a href="dashboard.php" class="btn btn-outline-secondary me-2">
+                    <i class="fas fa-arrow-left me-1"></i>Back to Dashboard
+                </a>
+                <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#billModal">
+                    <i class="fas fa-plus me-2"></i>Create New Bill
+                </button>
             </div>
         </div>
-        
+
+        <!-- Alerts -->
         <?php if ($message): ?>
-            <div class="alert <?php echo strpos($message, 'Error') === 0 ? 'alert-danger' : 'alert-success'; ?>">
-                <?php echo htmlspecialchars($message); ?>
-            </div>
+        <div class="alert alert-success alert-dismissible fade show">
+            <i class="fas fa-check-circle me-2"></i><?php echo $message; ?>
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
         <?php endif; ?>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <h3><?php echo number_format($stats['total_bills']); ?></h3>
-                <p>Total Bills</p>
+
+        <?php if ($error): ?>
+        <div class="alert alert-danger alert-dismissible fade show">
+            <i class="fas fa-exclamation-triangle me-2"></i><?php echo $error; ?>
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        <?php endif; ?>
+
+        <!-- Statistics -->
+        <div class="row mb-4">
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <i class="fas fa-file-invoice fa-2x text-primary mb-2"></i>
+                        <h4><?php echo $db->query("SELECT COUNT(*) as count FROM bills")->fetch()['count']; ?></h4>
+                        <p class="text-muted mb-0">Total Bills</p>
+                    </div>
+                </div>
             </div>
-            <div class="stat-card">
-                <h3>₹<?php echo number_format($stats['pending_amount'], 2); ?></h3>
-                <p>Pending Amount</p>
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <i class="fas fa-hourglass-half fa-2x text-warning mb-2"></i>
+                        <h4><?php echo $db->query("SELECT COUNT(*) as count FROM bills WHERE status = 'Pending'")->fetch()['count']; ?></h4>
+                        <p class="text-muted mb-0">Pending Bills</p>
+                    </div>
+                </div>
             </div>
-            <div class="stat-card">
-                <h3>₹<?php echo number_format($stats['today_revenue'], 2); ?></h3>
-                <p>Today's Revenue</p>
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <i class="fas fa-rupee-sign fa-2x text-success mb-2"></i>
+                        <h4><?php echo formatCurrency($db->query("SELECT COALESCE(SUM(total_amount), 0) as total FROM bills WHERE DATE(created_at) = CURDATE()")->fetch()['total']); ?></h4>
+                        <p class="text-muted mb-0">Today's Revenue</p>
+                    </div>
+                </div>
             </div>
-            <div class="stat-card">
-                <h3>₹<?php echo number_format($stats['monthly_revenue'], 2); ?></h3>
-                <p>Monthly Revenue</p>
+            <div class="col-md-3">
+                <div class="card text-center">
+                    <div class="card-body">
+                        <i class="fas fa-exclamation-triangle fa-2x text-danger mb-2"></i>
+                        <h4><?php echo $db->query("SELECT COUNT(*) as count FROM bills WHERE status = 'Overdue'")->fetch()['count']; ?></h4>
+                        <p class="text-muted mb-0">Overdue Bills</p>
+                    </div>
+                </div>
             </div>
         </div>
-        
-        <div class="filters">
-            <form method="GET" class="filter-form">
-                <div class="form-group">
-                    <label for="search">Search Bills</label>
-                    <input type="text" name="search" id="search" placeholder="Search by bill number, patient name..." 
-                           value="<?php echo htmlspecialchars($search); ?>">
+
+        <!-- Search and Filter -->
+        <div class="search-box">
+            <form method="GET" class="row g-3">
+                <div class="col-md-4">
+                    <div class="input-group">
+                        <span class="input-group-text"><i class="fas fa-search"></i></span>
+                        <input type="text" name="search" class="form-control" placeholder="Search by bill number, patient name..." value="<?php echo htmlspecialchars($search); ?>">
+                    </div>
                 </div>
-                
-                <div class="form-group">
-                    <label for="status">Status</label>
-                    <select name="status" id="status">
+                <div class="col-md-3">
+                    <select name="status" class="form-select">
                         <option value="">All Status</option>
-                        <option value="pending" <?php echo $filter_status === 'pending' ? 'selected' : ''; ?>>Pending</option>
-                        <option value="partial" <?php echo $filter_status === 'partial' ? 'selected' : ''; ?>>Partial</option>
-                        <option value="paid" <?php echo $filter_status === 'paid' ? 'selected' : ''; ?>>Paid</option>
-                        <option value="refunded" <?php echo $filter_status === 'refunded' ? 'selected' : ''; ?>>Refunded</option>
+                        <?php foreach (getBillStatuses() as $status): ?>
+                        <option value="<?php echo $status; ?>" <?php echo $status_filter === $status ? 'selected' : ''; ?>>
+                            <?php echo $status; ?>
+                        </option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
-                
-                <div class="form-group">
-                    <label for="date_from">From Date</label>
-                    <input type="date" name="date_from" id="date_from" value="<?php echo htmlspecialchars($filter_date_from); ?>">
+                <div class="col-md-2">
+                    <button type="submit" class="btn btn-primary w-100">Filter</button>
                 </div>
-                
-                <div class="form-group">
-                    <label for="date_to">To Date</label>
-                    <input type="date" name="date_to" id="date_to" value="<?php echo htmlspecialchars($filter_date_to); ?>">
-                </div>
-                
-                <div class="form-group">
-                    <button type="submit" class="btn btn-primary">Filter</button>
-                    <a href="billing.php" class="btn btn-secondary">Clear</a>
+                <div class="col-md-3 text-end">
+                    <a href="reports.php?type=billing" class="btn btn-outline-primary">
+                        <i class="fas fa-chart-bar me-1"></i>View Reports
+                    </a>
                 </div>
             </form>
         </div>
-        
-        <div class="bills-table">
-            <table class="table">
-                <thead>
-                    <tr>
-                        <th>Bill Number</th>
-                        <th>Patient</th>
-                        <th>Date</th>
-                        <th>Total Amount</th>
-                        <th>Paid Amount</th>
-                        <th>Balance</th>
-                        <th>Status</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php if (empty($bills)): ?>
-                        <tr>
-                            <td colspan="8" style="text-align: center; padding: 30px; color: #666;">
-                                No bills found for the selected criteria.
-                            </td>
-                        </tr>
-                    <?php else: ?>
-                        <?php foreach ($bills as $bill): ?>
-                            <tr>
-                                <td>
-                                    <strong><?php echo htmlspecialchars($bill['bill_number']); ?></strong>
-                                    <br>
-                                    <small style="color: #666;"><?php echo ucfirst($bill['bill_type']); ?></small>
-                                </td>
-                                <td>
-                                    <strong><?php echo htmlspecialchars($bill['patient_name']); ?></strong>
-                                    <br>
-                                    <small style="color: #666;">
-                                        ID: <?php echo htmlspecialchars($bill['patient_id']); ?><br>
-                                        <?php echo htmlspecialchars($bill['patient_phone']); ?>
-                                    </small>
-                                </td>
-                                <td><?php echo date('M d, Y', strtotime($bill['bill_date'])); ?></td>
-                                <td><strong>₹<?php echo number_format($bill['total_amount'], 2); ?></strong></td>
-                                <td>₹<?php echo number_format($bill['paid_amount'], 2); ?></td>
-                                <td>₹<?php echo number_format($bill['balance_amount'], 2); ?></td>
-                                <td>
-                                    <span class="badge badge-<?php echo $bill['payment_status']; ?>">
-                                        <?php echo ucfirst($bill['payment_status']); ?>
-                                    </span>
-                                </td>
-                                <td>
-                                    <?php if ($bill['payment_status'] !== 'paid'): ?>
-                                        <button onclick="openPaymentModal(<?php echo $bill['id']; ?>, '<?php echo $bill['bill_number']; ?>', <?php echo $bill['balance_amount']; ?>)" 
-                                                class="btn btn-success btn-sm">Record Payment</button>
-                                    <?php endif; ?>
-                                    <a href="bill-details.php?id=<?php echo $bill['id']; ?>" class="btn btn-primary btn-sm">View</a>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    <?php endif; ?>
-                </tbody>
-            </table>
-        </div>
-    </div>
-    
-    <!-- Create Bill Modal -->
-    <div id="billModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Create New Bill</h2>
-                <button type="button" class="close" onclick="closeBillModal()">&times;</button>
+
+        <!-- Bills List -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">
+                    <i class="fas fa-list me-2"></i>Bills List
+                    <span class="badge bg-light text-dark ms-2"><?php echo number_format($totalBills); ?> bills</span>
+                </h5>
             </div>
-            <div class="modal-body">
-                <form method="POST" id="billForm">
-                    <input type="hidden" name="action" value="create_bill">
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="patient_id">Patient *</label>
-                            <select id="patient_id" name="patient_id" required>
-                                <option value="">Select Patient</option>
-                                <?php foreach ($patients as $patient): ?>
-                                    <option value="<?php echo $patient['id']; ?>">
-                                        <?php echo htmlspecialchars($patient['full_name'] . ' (' . $patient['patient_id'] . ')'); ?>
-                                    </option>
-                                <?php endforeach; ?>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label for="bill_date">Bill Date *</label>
-                            <input type="date" id="bill_date" name="bill_date" value="<?php echo date('Y-m-d'); ?>" required>
-                        </div>
-                    </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="bill_type">Bill Type *</label>
-                            <select id="bill_type" name="bill_type" required>
-                                <option value="consultation">Consultation</option>
-                                <option value="pharmacy">Pharmacy</option>
-                                <option value="lab">Laboratory</option>
-                                <option value="admission">Admission</option>
-                                <option value="equipment">Equipment</option>
-                                <option value="miscellaneous">Miscellaneous</option>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label for="visit_id">Visit ID (Optional)</label>
-                            <input type="text" id="visit_id" name="visit_id">
-                        </div>
-                    </div>
-                    
-                    <div class="bill-items">
-                        <h4 style="margin-bottom: 15px; color: #004685;">Bill Items</h4>
-                        <div class="item-row" style="font-weight: 600; color: #666;">
-                            <div>Item Name</div>
-                            <div>Type</div>
-                            <div>Qty</div>
-                            <div>Price</div>
-                            <div>Total</div>
-                            <div>Action</div>
-                        </div>
-                        <div id="billItems">
-                            <div class="item-row">
-                                <input type="text" name="items[0][name]" placeholder="Item name" required>
-                                <select name="items[0][type]">
-                                    <option value="consultation">Consultation</option>
-                                    <option value="medicine">Medicine</option>
-                                    <option value="test">Test</option>
-                                    <option value="equipment">Equipment</option>
-                                    <option value="bed">Bed</option>
-                                    <option value="miscellaneous">Other</option>
-                                </select>
-                                <input type="number" name="items[0][quantity]" placeholder="1" min="1" step="1" value="1" required>
-                                <input type="number" name="items[0][price]" placeholder="0.00" min="0" step="0.01" required>
-                                <input type="number" class="item-total" readonly>
-                                <button type="button" onclick="removeItem(this)" class="btn btn-sm" style="background: #dc3545; color: white;">×</button>
+            <div class="card-body p-0">
+                <?php if (!empty($bills)): ?>
+                    <?php foreach ($bills as $bill): ?>
+                    <div class="bill-card">
+                        <div class="bill-header">
+                            <div>
+                                <div class="bill-number"><?php echo htmlspecialchars($bill['bill_number']); ?></div>
+                                <div class="text-muted">
+                                    <?php echo htmlspecialchars($bill['patient_name']); ?> 
+                                    (<?php echo htmlspecialchars($bill['patient_id']); ?>)
+                                </div>
+                            </div>
+                            <div class="text-end">
+                                <div class="bill-amount status-<?php echo strtolower(str_replace(' ', '-', $bill['status'])); ?>">
+                                    <?php echo formatCurrency($bill['total_amount']); ?>
+                                </div>
+                                <span class="badge bg-<?php 
+                                    echo $bill['status'] === 'Paid' ? 'success' : 
+                                        ($bill['status'] === 'Pending' ? 'warning' : 
+                                        ($bill['status'] === 'Overdue' ? 'danger' : 'info')); 
+                                ?>">
+                                    <?php echo $bill['status']; ?>
+                                </span>
                             </div>
                         </div>
-                        <button type="button" onclick="addItem()" class="btn btn-secondary">+ Add Item</button>
+                        
+                        <div class="row">
+                            <div class="col-md-6">
+                                <small class="text-muted">
+                                    <i class="fas fa-calendar me-1"></i>Bill Date: <?php echo formatDate($bill['bill_date'], 'd M Y'); ?>
+                                </small><br>
+                                <small class="text-muted">
+                                    <i class="fas fa-calendar-times me-1"></i>Due Date: <?php echo formatDate($bill['due_date'], 'd M Y'); ?>
+                                </small>
+                            </div>
+                            <div class="col-md-6 text-end">
+                                <small class="text-muted">
+                                    Paid: <?php echo formatCurrency($bill['paid_amount']); ?> | 
+                                    Balance: <?php echo formatCurrency($bill['balance_amount']); ?>
+                                </small>
+                            </div>
+                        </div>
+                        
+                        <div class="mt-3">
+                            <a href="bill-details.php?id=<?php echo $bill['id']; ?>" class="btn btn-sm btn-outline-primary me-1">
+                                <i class="fas fa-eye"></i> View
+                            </a>
+                            <a href="print-bill.php?id=<?php echo $bill['id']; ?>" target="_blank" class="btn btn-sm btn-outline-secondary me-1">
+                                <i class="fas fa-print"></i> Print
+                            </a>
+                            <?php if ($bill['balance_amount'] > 0): ?>
+                            <a href="?pay=<?php echo $bill['id']; ?>" class="btn btn-sm btn-success me-1">
+                                <i class="fas fa-credit-card"></i> Record Payment
+                            </a>
+                            <?php endif; ?>
+                        </div>
                     </div>
+                    <?php endforeach; ?>
                     
-                    <div class="bill-summary">
-                        <div class="summary-row">
-                            <span>Subtotal:</span>
-                            <span id="subtotal">₹0.00</span>
+                    <!-- Pagination -->
+                    <?php if ($totalPages > 1): ?>
+                    <div class="d-flex justify-content-center mt-4">
+                        <?php echo getPagination($page, $totalPages, "?search=" . urlencode($search) . "&status=" . urlencode($status_filter)); ?>
+                    </div>
+                    <?php endif; ?>
+                    
+                <?php else: ?>
+                <div class="text-center py-5">
+                    <i class="fas fa-file-invoice-dollar fa-3x text-muted mb-3"></i>
+                    <h5>No bills found</h5>
+                    <p class="text-muted">Try adjusting your search criteria or create a new bill.</p>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Bill Modal -->
+    <div class="modal fade" id="billModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-plus me-2"></i>Create New Bill
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <form method="POST" id="billForm">
+                    <div class="modal-body">
+                        <input type="hidden" name="action" value="create_bill">
+                        
+                        <div class="row g-3 mb-4">
+                            <div class="col-md-6">
+                                <label class="form-label">Patient <span class="text-danger">*</span></label>
+                                <select name="patient_id" class="form-select" required>
+                                    <option value="">Select Patient</option>
+                                    <?php foreach ($patients as $patient): ?>
+                                    <option value="<?php echo $patient['id']; ?>">
+                                        <?php echo htmlspecialchars($patient['first_name'] . ' ' . $patient['last_name'] . ' (' . $patient['patient_id'] . ')'); ?>
+                                    </option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Appointment (Optional)</label>
+                                <select name="appointment_id" class="form-select">
+                                    <option value="">Select Appointment</option>
+                                    <!-- Appointments will be loaded via AJAX based on patient selection -->
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Bill Date <span class="text-danger">*</span></label>
+                                <input type="date" name="bill_date" class="form-control" value="<?php echo date('Y-m-d'); ?>" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Due Date <span class="text-danger">*</span></label>
+                                <input type="date" name="due_date" class="form-control" value="<?php echo date('Y-m-d', strtotime('+30 days')); ?>" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Payment Terms</label>
+                                <input type="text" name="payment_terms" class="form-control" value="Net 30 days">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Tax Rate (%)</label>
+                                <input type="number" name="tax_rate" class="form-control" value="0" min="0" max="100" step="0.01">
+                            </div>
                         </div>
-                        <div class="summary-row">
-                            <span>Discount:</span>
-                            <span>
-                                ₹<input type="number" name="discount_amount" id="discount_amount" value="0" min="0" step="0.01" 
-                                        style="width: 80px; border: 1px solid #ddd; padding: 2px;">
-                            </span>
+
+                        <!-- Services Section -->
+                        <h6 class="mb-3">Bill Items</h6>
+                        <div id="billItems">
+                            <div class="item-row">
+                                <div class="row g-2">
+                                    <div class="col-md-5">
+                                        <select name="services[]" class="form-select" required>
+                                            <option value="">Select Service</option>
+                                            <?php foreach ($services as $service): ?>
+                                            <option value="<?php echo $service['id']; ?>" data-price="<?php echo $service['price']; ?>">
+                                                <?php echo htmlspecialchars($service['service_name'] . ' - ' . formatCurrency($service['price'])); ?>
+                                            </option>
+                                            <?php endforeach; ?>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <input type="number" name="quantities[]" class="form-control" placeholder="Qty" value="1" min="1" required>
+                                    </div>
+                                    <div class="col-md-3">
+                                        <input type="number" name="unit_prices[]" class="form-control" placeholder="Unit Price" step="0.01" required>
+                                    </div>
+                                    <div class="col-md-2">
+                                        <button type="button" class="btn btn-outline-danger" onclick="removeItem(this)">
+                                            <i class="fas fa-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
-                        <div class="summary-row">
-                            <span>Tax (18% GST):</span>
-                            <span id="tax_amount">₹0.00</span>
-                        </div>
-                        <div class="summary-row total">
-                            <span>Total Amount:</span>
-                            <span id="total_amount">₹0.00</span>
+                        
+                        <button type="button" class="btn btn-outline-primary mt-2" onclick="addItem()">
+                            <i class="fas fa-plus me-1"></i>Add Item
+                        </button>
+                        
+                        <div class="row g-3 mt-4">
+                            <div class="col-md-6">
+                                <label class="form-label">Discount Amount</label>
+                                <input type="number" name="discount_amount" class="form-control" value="0" min="0" step="0.01">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Notes</label>
+                                <textarea name="notes" class="form-control" rows="2"></textarea>
+                            </div>
                         </div>
                     </div>
-                    
-                    <div class="form-group">
-                        <label for="notes">Notes</label>
-                        <textarea id="notes" name="notes" rows="3" placeholder="Additional notes or comments..."></textarea>
-                    </div>
-                    
-                    <div style="text-align: right; margin-top: 20px;">
-                        <button type="button" onclick="closeBillModal()" class="btn btn-secondary">Cancel</button>
-                        <button type="submit" class="btn btn-primary">Create Bill</button>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="fas fa-save me-2"></i>Create Bill
+                        </button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
-    
-    <!-- Record Payment Modal -->
-    <div id="paymentModal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h2>Record Payment</h2>
-                <button type="button" class="close" onclick="closePaymentModal()">&times;</button>
-            </div>
-            <div class="modal-body">
+
+    <!-- Payment Modal -->
+    <?php if ($paymentBill): ?>
+    <div class="modal fade" id="paymentModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">
+                        <i class="fas fa-credit-card me-2"></i>Record Payment
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
                 <form method="POST">
-                    <input type="hidden" name="action" value="record_payment">
-                    <input type="hidden" name="bill_id" id="payment_bill_id">
-                    
-                    <div class="form-group">
-                        <label>Bill Number: <strong id="payment_bill_number"></strong></label>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Outstanding Balance: <strong id="payment_balance"></strong></label>
-                    </div>
-                    
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label for="payment_amount">Payment Amount *</label>
-                            <input type="number" id="payment_amount" name="payment_amount" min="0" step="0.01" required>
+                    <div class="modal-body">
+                        <input type="hidden" name="action" value="record_payment">
+                        <input type="hidden" name="bill_id" value="<?php echo $paymentBill['id']; ?>">
+                        
+                        <div class="mb-3">
+                            <strong>Bill: <?php echo htmlspecialchars($paymentBill['bill_number']); ?></strong><br>
+                            <span class="text-muted">Patient: <?php echo htmlspecialchars($paymentBill['patient_name']); ?></span><br>
+                            <span class="text-muted">Total Amount: <?php echo formatCurrency($paymentBill['total_amount']); ?></span><br>
+                            <span class="text-muted">Balance: <?php echo formatCurrency($paymentBill['balance_amount']); ?></span>
                         </div>
-                        <div class="form-group">
-                            <label for="payment_method">Payment Method *</label>
-                            <select id="payment_method" name="payment_method" required>
-                                <option value="cash">Cash</option>
-                                <option value="card">Card</option>
-                                <option value="online">Online Transfer</option>
-                                <option value="cheque">Cheque</option>
-                                <option value="insurance">Insurance</option>
-                            </select>
+                        
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label">Payment Amount <span class="text-danger">*</span></label>
+                                <input type="number" name="amount" class="form-control" max="<?php echo $paymentBill['balance_amount']; ?>" step="0.01" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Payment Method <span class="text-danger">*</span></label>
+                                <select name="payment_method" class="form-select" required>
+                                    <option value="">Select Method</option>
+                                    <?php foreach (getPaymentMethods() as $method): ?>
+                                    <option value="<?php echo $method; ?>"><?php echo $method; ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Payment Date <span class="text-danger">*</span></label>
+                                <input type="date" name="payment_date" class="form-control" value="<?php echo date('Y-m-d'); ?>" required>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">Transaction ID</label>
+                                <input type="text" name="transaction_id" class="form-control">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label">Reference Number</label>
+                                <input type="text" name="reference_number" class="form-control">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label">Notes</label>
+                                <textarea name="notes" class="form-control" rows="2"></textarea>
+                            </div>
                         </div>
                     </div>
-                    
-                    <div style="text-align: right; margin-top: 20px;">
-                        <button type="button" onclick="closePaymentModal()" class="btn btn-secondary">Cancel</button>
-                        <button type="submit" class="btn btn-success">Record Payment</button>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="submit" class="btn btn-success">
+                            <i class="fas fa-save me-2"></i>Record Payment
+                        </button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
-    
+    <?php endif; ?>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        let itemCount = 1;
-        
-        function openBillModal() {
-            document.getElementById('billModal').style.display = 'block';
-            calculateTotals();
-        }
-        
-        function closeBillModal() {
-            document.getElementById('billModal').style.display = 'none';
-        }
-        
-        function openPaymentModal(billId, billNumber, balance) {
-            document.getElementById('payment_bill_id').value = billId;
-            document.getElementById('payment_bill_number').textContent = billNumber;
-            document.getElementById('payment_balance').textContent = '₹' + balance.toFixed(2);
-            document.getElementById('payment_amount').value = balance.toFixed(2);
-            document.getElementById('paymentModal').style.display = 'block';
-        }
-        
-        function closePaymentModal() {
-            document.getElementById('paymentModal').style.display = 'none';
-        }
-        
         function addItem() {
-            const itemsContainer = document.getElementById('billItems');
+            const billItems = document.getElementById('billItems');
             const newItem = document.createElement('div');
             newItem.className = 'item-row';
             newItem.innerHTML = `
-                <input type="text" name="items[${itemCount}][name]" placeholder="Item name" required>
-                <select name="items[${itemCount}][type]">
-                    <option value="consultation">Consultation</option>
-                    <option value="medicine">Medicine</option>
-                    <option value="test">Test</option>
-                    <option value="equipment">Equipment</option>
-                    <option value="bed">Bed</option>
-                    <option value="miscellaneous">Other</option>
-                </select>
-                <input type="number" name="items[${itemCount}][quantity]" placeholder="1" min="1" step="1" value="1" required>
-                <input type="number" name="items[${itemCount}][price]" placeholder="0.00" min="0" step="0.01" required>
-                <input type="number" class="item-total" readonly>
-                <button type="button" onclick="removeItem(this)" class="btn btn-sm" style="background: #dc3545; color: white;">×</button>
+                <div class="row g-2">
+                    <div class="col-md-5">
+                        <select name="services[]" class="form-select" required>
+                            <option value="">Select Service</option>
+                            <?php foreach ($services as $service): ?>
+                            <option value="<?php echo $service['id']; ?>" data-price="<?php echo $service['price']; ?>">
+                                <?php echo htmlspecialchars($service['service_name'] . ' - ' . formatCurrency($service['price'])); ?>
+                            </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div class="col-md-2">
+                        <input type="number" name="quantities[]" class="form-control" placeholder="Qty" value="1" min="1" required>
+                    </div>
+                    <div class="col-md-3">
+                        <input type="number" name="unit_prices[]" class="form-control" placeholder="Unit Price" step="0.01" required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="button" class="btn btn-outline-danger" onclick="removeItem(this)">
+                            <i class="fas fa-trash"></i>
+                        </button>
+                    </div>
+                </div>
             `;
-            itemsContainer.appendChild(newItem);
-            itemCount++;
+            billItems.appendChild(newItem);
             
-            // Add event listeners to new inputs
-            const quantityInput = newItem.querySelector('input[name*="[quantity]"]');
-            const priceInput = newItem.querySelector('input[name*="[price]"]');
-            quantityInput.addEventListener('input', calculateTotals);
-            priceInput.addEventListener('input', calculateTotals);
+            // Add event listener for service selection
+            const serviceSelect = newItem.querySelector('select[name="services[]"]');
+            const priceInput = newItem.querySelector('input[name="unit_prices[]"]');
+            
+            serviceSelect.addEventListener('change', function() {
+                const selectedOption = this.options[this.selectedIndex];
+                const price = selectedOption.getAttribute('data-price');
+                if (price) {
+                    priceInput.value = price;
+                }
+            });
         }
         
         function removeItem(button) {
             button.closest('.item-row').remove();
-            calculateTotals();
         }
         
-        function calculateTotals() {
-            let subtotal = 0;
-            
-            document.querySelectorAll('.item-row').forEach(row => {
-                const quantityInput = row.querySelector('input[name*="[quantity]"]');
-                const priceInput = row.querySelector('input[name*="[price]"]');
-                const totalInput = row.querySelector('.item-total');
-                
-                if (quantityInput && priceInput && totalInput) {
-                    const quantity = parseFloat(quantityInput.value) || 0;
-                    const price = parseFloat(priceInput.value) || 0;
-                    const total = quantity * price;
-                    
-                    totalInput.value = total.toFixed(2);
-                    subtotal += total;
-                }
-            });
-            
-            const discount = parseFloat(document.getElementById('discount_amount').value) || 0;
-            const taxableAmount = subtotal - discount;
-            const taxAmount = taxableAmount * 0.18;
-            const totalAmount = taxableAmount + taxAmount;
-            
-            document.getElementById('subtotal').textContent = '₹' + subtotal.toFixed(2);
-            document.getElementById('tax_amount').textContent = '₹' + taxAmount.toFixed(2);
-            document.getElementById('total_amount').textContent = '₹' + totalAmount.toFixed(2);
-        }
-        
-        // Add event listeners
+        // Add event listeners for existing items
         document.addEventListener('DOMContentLoaded', function() {
-            // Initial calculation
-            calculateTotals();
-            
-            // Add listeners to existing inputs
-            document.querySelectorAll('input[name*="[quantity]"], input[name*="[price]"]').forEach(input => {
-                input.addEventListener('input', calculateTotals);
+            document.querySelectorAll('select[name="services[]"]').forEach(select => {
+                const priceInput = select.closest('.item-row').querySelector('input[name="unit_prices[]"]');
+                
+                select.addEventListener('change', function() {
+                    const selectedOption = this.options[this.selectedIndex];
+                    const price = selectedOption.getAttribute('data-price');
+                    if (price) {
+                        priceInput.value = price;
+                    }
+                });
             });
-            
-            document.getElementById('discount_amount').addEventListener('input', calculateTotals);
         });
-        
-        // Close modal when clicking outside
-        window.onclick = function(event) {
-            const billModal = document.getElementById('billModal');
-            const paymentModal = document.getElementById('paymentModal');
-            
-            if (event.target === billModal) {
-                closeBillModal();
-            }
-            if (event.target === paymentModal) {
-                closePaymentModal();
-            }
-        }
+
+        // Show payment modal if needed
+        <?php if ($paymentBill): ?>
+        document.addEventListener('DOMContentLoaded', function() {
+            new bootstrap.Modal(document.getElementById('paymentModal')).show();
+        });
+        <?php endif; ?>
     </script>
 </body>
 </html>
